@@ -1,4 +1,5 @@
 Вот подробный разбор главы об ICO из книги *"The Basics of Bitcoins and Blockchains"* Антони Льюиса:
+[The Basics of Bitcoins and Blockchains](https://www.amazon.com/Basics-Bitcoins-Blockchains-Introduction-Cryptocurrencies-ebook/dp/B08RWTV6BW/)
 
 ---
 
