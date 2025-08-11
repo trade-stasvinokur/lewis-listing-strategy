@@ -24,34 +24,97 @@ load_dotenv()
 
 COINMARKETCAL_API_KEY = os.getenv("COINMARKETCAL_API_KEY")
 
-COINMARKETCAL_URL = "https://developers.coinmarketcal.com/v1/events"
-BINANCE_URL = "https://api.binance.com/api/v3/klines"
+COINMARKETCAL_BASE = os.getenv("COINMARKETCAL_BASE")
+EVENTS_URL = f"{COINMARKETCAL_BASE}/events"
+CATEGORIES_URL = f"{COINMARKETCAL_BASE}/categories"
+BINANCE_URL =  os.getenv("BINANCE_URL")
+
+HEADERS = {
+    "x-api-key": COINMARKETCAL_API_KEY,
+    "Accept": "application/json",
+}
 
 
-def get_recent_listings(days: int = 7, limit: int = 10) -> List[dict]:
-    """Return listing events from the past ``days`` days."""
+def get_category_ids_for_listings() -> str:
+    """
+    Возвращает строку ID категорий, связанных с листингами на биржах.
+    Подбираем по названию ('list', 'exchang') чтобы не хардкодить числа.
+    """
+    r = requests.get(CATEGORIES_URL, headers=HEADERS, timeout=15)
+    r.raise_for_status()
+    cats = r.json()
+    wanted_ids = [
+        str(c["id"]) for c in cats
+        if isinstance(c, dict)
+        and "name" in c
+        and any(k in c["name"].lower() for k in ("list", "exchang"))
+    ]
+    return ",".join(wanted_ids)
+
+def get_recent_listings(days: int = 7, limit: int = 75):
+    """
+    Возвращает ВСЕ события за период, проходя по страницам до пустого body.
+    `limit` = размер страницы (параметр API `max`, допускается 1..75).
+    """
+    if not COINMARKETCAL_API_KEY:
+        raise SystemExit("Please set COINMARKETCAL_API_KEY environment variable")
+
+    # страхуем базу/URL'ы на случай пустой переменной окружения
+    base = (COINMARKETCAL_BASE or "https://developers.coinmarketcal.com/v1").rstrip("/")
+    events_url = f"{base}/events"
 
     end = datetime.now(timezone.utc)
     start = end - timedelta(days=days)
 
-    headers = {"x-api-key": COINMARKETCAL_API_KEY}
-    params = {
-        "categories": "listing",
-        "sortBy": "date",
-        "dateRangeStart": start.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "dateRangeEnd": end.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "max": limit,
+    per_page = max(1, min(int(limit), 75))
+    common_params = {
+        "dateRangeStart": start.strftime("%Y-%m-%d"),
+        "dateRangeEnd": end.strftime("%Y-%m-%d"),
+        "sortBy": "created_desc",
+        "max": per_page,
     }
 
-    response = requests.get(
-        COINMARKETCAL_URL,
-        headers=headers,
-        params=params,
-        timeout=10,
-        proxies={"https": ""},
-    )
-    response.raise_for_status()
-    return response.json()
+    # попытка ограничиться именно листингами (категории типа Exchange/Listing)
+    try:
+        listing_ids = get_category_ids_for_listings()
+        if listing_ids:
+            common_params["categories"] = listing_ids
+    except requests.HTTPError:
+        pass
+
+    all_events = []
+    page = 1
+    while True:
+        params = dict(common_params, page=page)
+        r = requests.get(events_url, headers=HEADERS, params=params, timeout=15)
+        try:
+            r.raise_for_status()
+        except requests.HTTPError as e:
+            # выводим тело ответа для диагностики и пробрасываем ошибку
+            try:
+                print(r.text)
+            finally:
+                raise e
+
+        data = r.json()
+        body = data.get("body") or []
+        if not body:
+            break
+
+        all_events.extend(body)
+
+        meta = data.get("_metadata") or {}
+        page_count = meta.get("page_count")
+        # условия остановки: дошли до последней страницы по метаданным
+        if isinstance(page_count, int) and page >= page_count:
+            break
+        # ...или получили "короткую" страницу (< per_page)
+        if len(body) < per_page:
+            break
+
+        page += 1
+
+    return all_events
 
 
 def fetch_klines(symbol: str, start: datetime, end: datetime) -> List[list]:
@@ -99,11 +162,29 @@ def main(take_profit: float) -> None:
     count = 0
 
     for event in events:
-        coin = event.get("coin", {})
-        symbol = f"{coin.get('symbol', '').upper()}USDT"
-        start = datetime.fromisoformat(event["date"].replace("Z", "+00:00"))
-        end = start + timedelta(days=7)
+        # 1) Берём только листинги/релистинги на бирже Binance
+        cats = event.get("categories", [])
+        if cats and not any("exchange" in (c.get("name","").lower()) or c.get("id") == 4 for c in cats):
+            continue
 
+        if not 'binance' in event.get("-").lower():
+            continue
+
+        # 2) coins — это список; берём первую монету
+        coins = event.get("coins", [])
+        if not coins:
+            continue
+        coin = coins[0]
+        symbol = f"{coin.get('symbol','').upper()}USDT"
+
+        # 3) Правильная дата события
+        date_str = event.get("date_event") or event.get("created_date")
+        if not date_str:
+            continue
+        start = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+        end = start + timedelta(days=7)
+        
+        print(f"Processing coin: {coin} with event title: {event.get('-')} and date: {event.get('date_event')}")
         try:
             klines = fetch_klines(symbol, start, end)
         except requests.HTTPError:
@@ -117,7 +198,9 @@ def main(take_profit: float) -> None:
 
         total += pnl
         count += 1
-        print(f"{event['date']} - {coin.get('name')} ({symbol}) P&L: {pnl*100:.2f}%")
+        title_en = (event.get("title") or {}).get("en", "")
+        disp_date = event.get("displayed_date", date_str)
+        print(f"{disp_date} - {title_en} / {coin.get('name')} ({symbol}) P&L: {pnl*100:.2f}%")
 
     if count:
         print(f"\nAverage P&L over {count} events: {total / count * 100:.2f}%")
