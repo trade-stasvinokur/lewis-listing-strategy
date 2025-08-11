@@ -17,6 +17,9 @@ from typing import List
 import argparse
 
 import requests
+from dotenv import load_dotenv
+
+load_dotenv()
 
 
 COINMARKETCAL_API_KEY = os.getenv("COINMARKETCAL_API_KEY")
