@@ -1,3 +1,5 @@
 .env
 uv.lock
 .vscode/
+all_file_content.py
+all_files_content.txt
