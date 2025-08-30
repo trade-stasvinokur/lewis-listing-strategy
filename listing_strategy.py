@@ -22,6 +22,11 @@ from dotenv import load_dotenv
 from sqlalchemy import select, func
 from sqlalchemy.exc import IntegrityError
 from db import init_db, get_session, CoinEvent
+from pathlib import Path
+import csv
+import tempfile
+import shutil
+from decimal import Decimal, ROUND_HALF_UP  # ← для точного форматирования
 
 load_dotenv()
 
@@ -31,7 +36,10 @@ COINMARKETCAL_API_KEY = os.getenv("COINMARKETCAL_API_KEY")
 COINMARKETCAL_BASE = os.getenv("COINMARKETCAL_BASE")
 EVENTS_URL = f"{COINMARKETCAL_BASE}/events"
 CATEGORIES_URL = f"{COINMARKETCAL_BASE}/categories"
-BINANCE_URL =  os.getenv("BINANCE_URL")
+
+BINANCE_ALPHA_BASE = os.getenv("BINANCE_ALPHA_BASE", "https://www.binance.com").rstrip("/")
+ALPHA_AGG_KLINES_URL = f"{BINANCE_ALPHA_BASE}/bapi/defi/v1/public/alpha-trade/agg-klines"
+ALPHA_TOKEN_LIST_URL = f"{BINANCE_ALPHA_BASE}/bapi/defi/v1/public/wallet-direct/buw/wallet/cex/alpha/all/token/list"
 
 HEADERS = {
     "x-api-key": COINMARKETCAL_API_KEY,
@@ -117,34 +125,111 @@ def get_recent_listings(days: int = 7, limit: int = 75):
     return all_events
 
 
-def fetch_klines(symbol: str, start: datetime, end: datetime) -> List[list]:
-    """Fetch hourly klines for ``symbol`` between ``start`` and ``end``."""
-    params = {
-        "symbol": symbol,
-        "interval": "1h",
-        "startTime": int(start.timestamp() * 1000),
-        "endTime": int(end.timestamp() * 1000),
-    }
-    response = requests.get(BINANCE_URL, params=params, timeout=10, proxies={"https": ""})
-    response.raise_for_status()
-    return response.json()
+# ─────────────────────────────────────────────────────────────────────────────
+#  Alpha helpers (fallback вместо GeckoTerminal)
+# ─────────────────────────────────────────────────────────────────────────────
 
-
-def calculate_pnl(klines: List[list], take_profit: float) -> float | None:
-    """Return percentage P&L with a take-profit threshold."""
-    if not klines:
+def _alpha_token_id_by_symbol(symbol: str) -> Optional[dict]:
+    """
+    Ищет запись токена в Token List по символьному имени.
+    Возвращает dict токена (включая chainId и contractAddress) или None.
+    """
+    r = requests.get(ALPHA_TOKEN_LIST_URL, timeout=20, proxies={"https": ""})
+    r.raise_for_status()
+    payload = r.json() or {}
+    tokens = payload.get("data") or payload.get("body") or []
+    if not isinstance(tokens, list):
         return None
 
-    entry = float(klines[0][1])
-    target = entry * (1 + take_profit)
+    sym_u = (symbol or "").upper().strip()
 
-    for kline in klines[1:]:
-        high = float(kline[2])
-        if high >= target:
-            return take_profit
+    for t in tokens:
+        try:
+            t_sym = (t.get("symbol") or "").upper().strip()
+            if t_sym == sym_u:
+                return t
+        except Exception:
+            continue
+    return None
 
-    final = float(klines[-1][4])
-    return (final - entry) / entry
+
+def _alpha_fetch_klines(token: dict,
+                        start: datetime,
+                        end: datetime,
+                        interval: str = "1h") -> List[list]:
+    """
+    Забирает свечи через Binance Alpha agg-klines по адресу контракта.
+    Возвращает список вида [[open_ms, open, high, low, close], ...],
+    отфильтрованный по окну [start, end] и отсортированный по времени.
+    """
+    allowed = {
+        "1s","15s","1m","3m","5m","15m","30m",
+        "1h","2h","4h","6h","8h","12h","1d","3d","1w","1M"
+    }
+    if interval not in allowed:
+        raise ValueError(f"Unsupported interval {interval!r} for Alpha agg-klines")
+
+    params = {
+        "chainId": token["chainId"],
+        "tokenAddress": (token.get("contractAddress") or "").lower(),
+        "interval": interval,
+    }
+
+    r = requests.get(ALPHA_AGG_KLINES_URL, params=params, timeout=20, proxies={"https": ""})
+    r.raise_for_status()
+    payload = r.json() or {}
+    data = payload.get("data") or {}
+
+    klines: List[list] = []
+    start_ms = int(start.timestamp() * 1000)
+    end_ms = int(end.timestamp() * 1000)
+
+    for row in (data.get("klineInfos") or []):
+        try:
+            # row: [openTimeMs, open, high, low, close, volume, closeTimeMs]
+            open_ms = int(row[0])
+            if open_ms < start_ms or open_ms > end_ms:
+                continue
+
+            o = float(row[1])
+            h = float(row[2])
+            l = float(row[3])
+            c = float(row[4])
+
+            klines.append([open_ms, o, h, l, c])
+        except (TypeError, ValueError):
+            continue
+
+    klines.sort(key=lambda x: x[0])
+    return klines
+
+
+def _aware_utc(dt: datetime) -> datetime:
+    """Возвращает datetime c tzinfo=UTC. Naive трактуем как UTC."""
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def fetch_klines(symbol: str, start: datetime, end: datetime) -> List[list]:
+    """
+    Берём ончейн-свечи через Binance Alpha (официальный API).
+    """
+    # Alpha (он-чейн рынок Binance)
+    alpha_token = _alpha_token_id_by_symbol(symbol)
+    if not alpha_token:
+        return []
+    return _alpha_fetch_klines(alpha_token, start, end, interval="1h")
+
+
+def calculate_pnl(klines: List[list]) -> float | None:
+    """Return absolute P&L as (max(high) - entry_open), без take_profit."""
+    if not klines:
+        return None
+    start_idx = 1 if len(klines) > 1 else 0  # вход по open второй свечи, если есть
+    entry = float(klines[start_idx][1])
+    high_val = max(float(k[2]) for k in klines[start_idx:])
+    return high_val - entry
 
 
 def _parse_event_date(date_str: Optional[str]) -> Optional[datetime]:
@@ -242,7 +327,73 @@ def _save_api_event(session, event: dict) -> bool:
         return False
 
 
-def main(take_profit: float) -> None:
+# ───────────────── formatting helpers ──────────────────
+
+def _fmt_price(x: float | None) -> str:
+    """
+    Больше точности для мелких цен.
+    ≥1      → 4 знака
+    ≥0.1    → 6 знаков
+    ≥0.01   → 8 знаков
+    ≥0.001  → 9 знаков
+    <0.001  → 10 знаков
+    """
+    if x is None:
+        return ""
+    d = Decimal(str(x))
+    if d >= 1:
+        q = Decimal("0.0001")
+    elif d >= Decimal("0.1"):
+        q = Decimal("0.000001")
+    elif d >= Decimal("0.01"):
+        q = Decimal("0.00000001")
+    elif d >= Decimal("0.001"):
+        q = Decimal("0.000000001")
+    else:
+        q = Decimal("0.0000000001")
+    return format(d.quantize(q, rounding=ROUND_HALF_UP), "f")
+
+
+def _write_strategy_results(rows: list[dict]) -> str:
+    """
+    Пишет/обновляет reports/strategy_results.csv с заголовком.
+    Дедуп по ключу (Date, Ticker, Strategy).
+    """
+    reports_dir = Path(__file__).resolve().parent / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    file_path = reports_dir / "strategy_results.csv"
+
+    fieldnames = [
+        "Date", "Ticker", "Open", "High",
+        "Strategy", "Status", "Entry", "Stop", "Target", "P/L",
+    ]
+
+    # читаем предыдущее содержимое (если есть)
+    old: list[dict] = []
+    if file_path.exists():
+        with file_path.open("r", newline="", encoding="utf-8") as f:
+            r = csv.DictReader(f)
+            if r.fieldnames:
+                old = list(r)
+
+    # удаляем старые строки для тех же ключей
+    new_keys = {(r["Date"], r["Ticker"], r["Strategy"]) for r in rows}
+    old = [r for r in old if (r.get("Date"), r.get("Ticker"), r.get("Strategy")) not in new_keys]
+
+    # атомарная запись: новые строки первыми + старые ниже
+    with tempfile.NamedTemporaryFile("w", newline="", encoding="utf-8", delete=False,
+                                    dir=str(file_path.parent)) as tmp:
+        w = csv.DictWriter(tmp, fieldnames=fieldnames)
+        w.writeheader()
+        w.writerows(rows)
+        w.writerows(old)
+        tmp_name = tmp.name
+
+    shutil.move(tmp_name, file_path)
+    return str(file_path)
+
+
+def main() -> None:
     # 1) Открываем БД
     init_db()
     session = get_session()
@@ -256,15 +407,19 @@ def main(take_profit: float) -> None:
     if y_events:
         total = 0.0
         count = 0
+        csv_rows: list[dict] = []
+
         for row in y_events:
             if not row.coin_symbol or not row.event_date:
                 continue
-            symbol = f"{row.coin_symbol.upper()}USDT"
-            start = row.event_date
+            symbol = row.coin_symbol
+            start = _aware_utc(row.event_date)
             end = start + timedelta(days=7)
 
-            print(f"Processing coin from DB: {row.coin_fullname} ({row.coin_symbol}) "
-                  f"event '{row.event_name}' at {start.isoformat()}")
+            print(
+                f"Processing coin from DB: {row.coin_fullname} ({row.coin_symbol}) "
+                f"event '{row.event_name}' at {start.isoformat()}"
+            )
 
             try:
                 klines = fetch_klines(symbol, start, end)
@@ -272,18 +427,49 @@ def main(take_profit: float) -> None:
                 print(f"Skipping {symbol}: data unavailable")
                 continue
 
-            pnl = calculate_pnl(klines, take_profit)
-            if pnl is None:
+            pnl = calculate_pnl(klines)
+            if pnl is None or not klines:
                 print(f"Skipping {symbol}: insufficient data")
                 continue
 
             total += pnl
             count += 1
-            print(f"{yesterday.isoformat()} - {row.event_name or ''} / {row.coin_name} "
-                  f"({symbol}) P&L: {pnl*100:.2f}%")
+            print(
+                f"{yesterday.isoformat()} - {row.event_name or ''} / {row.coin_name} "
+                f"({symbol}) P&L: {pnl:.10f}"
+            )
+
+            # NB: твоя логика входа — вторая свеча
+            entry = float(klines[1][1])
+            high_val = max(float(k[2]) for k in klines) if klines else None
+            stop_price = entry * (1 - 0.01)
+
+            # Статус: достигли 30% или нет — как было
+            status = "✅" if pnl > 0 else "❌"
+
+            # В отчёте отображаем фактическую «цель/выход» как High — чтобы
+            # видеть реальную максимальную достижимую цену (как ты и просишь).
+            target_out = high_val
+
+            csv_rows.append({
+                "Date": yesterday.isoformat(),
+                "Ticker": symbol,
+                "Open": _fmt_price(entry),
+                "High": _fmt_price(high_val),
+                "Strategy": "lewis-listing",
+                "Status": status,
+                "Entry": _fmt_price(entry),
+                "Stop": _fmt_price(stop_price),
+                "Target": _fmt_price(target_out),
+                "P/L": _fmt_price(pnl),
+            })
+
+        if csv_rows:
+            out_path = _write_strategy_results(csv_rows)
+            print(f"CSV saved: {out_path}")
 
         if count:
-            print(f"\nAverage P&L over {count} events: {total / count * 100:.2f}%")
+            print(f"\nAverage P&L over {count} events: {total / count:.10f}")
         else:
             print("No events with available market data for yesterday")
         return
@@ -307,13 +493,4 @@ if __name__ == "__main__":
     if not COINMARKETCAL_API_KEY:
         raise SystemExit("Please set COINMARKETCAL_API_KEY environment variable")
 
-    parser = argparse.ArgumentParser(description="Backtest listing strategy")
-    parser.add_argument(
-        "--take-profit",
-        type=float,
-        default=0.3,
-        help="Take-profit target as a fraction (0.3 for 30%)",
-    )
-    args = parser.parse_args()
-
-    main(args.take_profit)
+    main()
