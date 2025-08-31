@@ -1,0 +1,13 @@
+services:
+  listing_strategy:
+    build:
+      context: .
+    container_name: lewis_listing_strategy
+    restart: unless-stopped
+    volumes:
+      - type: bind
+        source: ./lewis.db
+        target: /app/lewis.db
+      - type: bind
+        source: ./reports
+        target: /app/reports

@@ -126,7 +126,7 @@ def get_recent_listings(days: int = 7, limit: int = 75):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Alpha helpers (fallback вместо GeckoTerminal)
+#  Alpha helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _alpha_token_id_by_symbol(symbol: str) -> Optional[dict]:
@@ -408,6 +408,7 @@ def main() -> None:
         total = 0.0
         count = 0
         csv_rows: list[dict] = []
+        processed_rows: list[CoinEvent] = []
 
         for row in y_events:
             if not row.coin_symbol or not row.event_date:
@@ -464,9 +465,21 @@ def main() -> None:
                 "P/L": _fmt_price(pnl),
             })
 
+            processed_rows.append(row)
+
         if csv_rows:
             out_path = _write_strategy_results(csv_rows)
             print(f"CSV saved: {out_path}")
+
+            # Удаляем обработанные события из БД
+            if processed_rows:
+                for r in processed_rows:
+                    try:
+                        session.delete(r)
+                    except Exception as e:
+                        print(f"Delete failed for id={getattr(r,'id',None)}: {e}")
+                session.commit()
+                print(f"Deleted {len(processed_rows)} processed event(s) from lewis.db.")
 
         if count:
             print(f"\nAverage P&L over {count} events: {total / count:.10f}")

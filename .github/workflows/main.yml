@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  schedule:
+    - cron: '30 23 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get path
+        run: echo ${GITHUB_WORKSPACE}
+
+      - name: Update OS without interactive prompts
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          sudo apt-get update -y
+          sudo apt-get upgrade -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold"
+          sudo apt-get dist-upgrade -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold"
+          sudo apt autoremove -y
+
+      - name: Install docker
+        run: |
+          if [[ $(which docker) && $(docker --version) ]]; then true; 
+          else
+            curl -fsSL https://get.docker.com -o get-docker.sh
+            sudo sh get-docker.sh
+            sudo systemctl enable docker
+            sudo systemctl start docker
+          fi;
+
+      - name: Create .env
+        env:
+          COINMARKETCAL_API_KEY: ${{ secrets.COINMARKETCAL_API_KEY }}
+        run: |
+          cat > "$GITHUB_WORKSPACE/.env" <<'EOF'
+          COINMARKETCAL_API_KEY='"${COINMARKETCAL_API_KEY}"'
+          COINMARKETCAL_BASE=https://developers.coinmarketcal.com/v1
+          BINANCE_ALPHA_BASE=https://www.binance.com
+          EOF
+          chmod 600 "$GITHUB_WORKSPACE/.env"
+
+      - name: Build, run docker and follow logs (25 min)
+        run: |
+          set -e
+          cd ${GITHUB_WORKSPACE}
+          docker compose -f docker-compose.yml build --no-cache
+          docker compose -f docker-compose.yml up -d
+          echo "::group::docker compose live logs"
+          timeout 1500 docker compose logs -f --no-color || true
+          echo "::endgroup::"
+          ls -l reports && head -n 5 reports/strategy_results.csv
+
+      - name: Fail if report is missing
+        run: test -f reports/strategy_results.csv
+
+      - name: Fail if lewis.db is missing
+        run: test -f lewis.db
+
+      - name: Commit strategy_results.csv and lewis.db
+        uses: stefanzweifel/git-auto-commit-action@v6
+        with:
+          commit_message: 'chore(ci): update strategy_results.csv & lewis.db'
+          file_pattern: 'reports/strategy_results.csv lewis.db'
+
+      - name: Docker image prune final
+        run: |
+          docker system prune -af
+          sudo rm -rf /var/log/*
